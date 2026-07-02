@@ -36,6 +36,9 @@ use crate::error::Error;
 /// Embedded pre-compiled runtime.
 const EMBEDDED_RUNTIME: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/runtime.cwasm"));
 
+/// Embedded runtime component bytes for custom-engine experiments.
+const EMBEDDED_RUNTIME_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/runtime.wasm"));
+
 /// Compute a short hash of the embedded runtime for cache validation.
 /// Returns the first 16 hex characters of SHA-256.
 fn runtime_content_hash() -> String {
@@ -175,6 +178,21 @@ impl EmbeddedResources {
     #[must_use]
     pub fn runtime(&self) -> &Path {
         &self.runtime_path
+    }
+
+    /// Return embedded runtime component bytes when available.
+    ///
+    /// Normal embedded sessions use the precompiled `.cwasm` artifact. This
+    /// component form exists for custom-engine experiments, such as PRD 010
+    /// tracking memory, where the precompiled artifact may not be compatible
+    /// with the caller's engine configuration.
+    #[must_use]
+    pub fn runtime_wasm_bytes() -> Option<&'static [u8]> {
+        if EMBEDDED_RUNTIME_WASM.is_empty() {
+            None
+        } else {
+            Some(EMBEDDED_RUNTIME_WASM)
+        }
     }
 }
 

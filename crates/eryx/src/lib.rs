@@ -58,6 +58,8 @@ pub mod embedded;
 #[cfg(feature = "embedded-stdlib")]
 pub mod embedded_stdlib;
 mod error;
+#[cfg(all(unix, any(feature = "embedded", feature = "preinit")))]
+pub mod host_memory;
 mod library;
 pub mod net;
 pub mod package;

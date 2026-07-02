@@ -40,7 +40,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use wasmtime::Store;
-use wasmtime::component::ResourceTable;
+use wasmtime::component::types::ComponentItem;
+use wasmtime::component::{Instance as ComponentInstance, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder};
 
 use crate::callback::Callback;
@@ -175,6 +176,18 @@ impl PythonStateSnapshot {
                 size_bytes,
             },
         })
+    }
+}
+
+fn component_item_kind(item: &ComponentItem) -> &'static str {
+    match item {
+        ComponentItem::ComponentFunc(_) => "component-func",
+        ComponentItem::CoreFunc(_) => "core-func",
+        ComponentItem::Module(_) => "core-module",
+        ComponentItem::Component(_) => "component",
+        ComponentItem::ComponentInstance(_) => "component-instance",
+        ComponentItem::Type(_) => "type",
+        ComponentItem::Resource(_) => "resource",
     }
 }
 
@@ -450,6 +463,13 @@ pub struct SessionExecutor {
     /// This is `Option` so we can take ownership during async execution.
     bindings: Option<SandboxBindings>,
 
+    /// The raw component instance handle.
+    ///
+    /// Typed bindings hide the underlying component instance. Keeping this
+    /// handle lets the fork inspect component exports from the host side while
+    /// preserving the existing typed-call path.
+    instance: Option<ComponentInstance>,
+
     /// Number of executions performed in this session.
     execution_count: u32,
 
@@ -602,6 +622,24 @@ fn build_hybrid_vfs_context(
 }
 
 impl SessionExecutor {
+    async fn instantiate_component(
+        executor: &PythonExecutor,
+        store: &mut Store<ExecutorState>,
+        error_context: &str,
+    ) -> Result<(ComponentInstance, SandboxBindings), Error> {
+        let instance = executor
+            .instance_pre()
+            .instance_pre()
+            .instantiate_async(&mut *store)
+            .await
+            .map_err(|e| Error::WasmEngine(format!("Failed to {error_context}: {e}")))?;
+
+        let bindings = SandboxBindings::new(&mut *store, &instance)
+            .map_err(|e| Error::WasmEngine(format!("Failed to load sandbox bindings: {e}")))?;
+
+        Ok((instance, bindings))
+    }
+
     /// Create a new session executor from a `PythonExecutor`.
     ///
     /// This instantiates the WASM component and keeps it alive for reuse.
@@ -748,12 +786,9 @@ impl SessionExecutor {
             .set_fuel(u64::MAX)
             .map_err(|e| Error::WasmEngine(format!("Failed to set fuel: {e}")))?;
 
-        // Instantiate the component
-        let bindings = executor
-            .instance_pre()
-            .instantiate_async(&mut store)
-            .await
-            .map_err(|e| Error::WasmEngine(format!("Failed to instantiate component: {e}")))?;
+        // Instantiate the component and keep both raw and typed handles.
+        let (instance, bindings) =
+            Self::instantiate_component(&executor, &mut store, "instantiate component").await?;
 
         // Configure the result-capture variable name once for the session
         // (the guest defaults to "result", so only call for a custom name).
@@ -772,6 +807,7 @@ impl SessionExecutor {
             executor,
             store: Some(store),
             bindings: Some(bindings),
+            instance: Some(instance),
             execution_count: 0,
             execution_timeout: None,
             fuel_limit: None,
@@ -813,12 +849,9 @@ impl SessionExecutor {
             .set_fuel(u64::MAX)
             .map_err(|e| Error::WasmEngine(format!("Failed to set fuel: {e}")))?;
 
-        // Instantiate the component
-        let bindings = executor
-            .instance_pre()
-            .instantiate_async(&mut store)
-            .await
-            .map_err(|e| Error::WasmEngine(format!("Failed to instantiate component: {e}")))?;
+        // Instantiate the component and keep both raw and typed handles.
+        let (instance, bindings) =
+            Self::instantiate_component(&executor, &mut store, "instantiate component").await?;
 
         // Configure the result-capture variable name once for the session
         // (the guest defaults to "result", so only call for a custom name).
@@ -837,6 +870,7 @@ impl SessionExecutor {
             executor,
             store: Some(store),
             bindings: Some(bindings),
+            instance: Some(instance),
             execution_count: 0,
             execution_timeout: None,
             fuel_limit: None,
@@ -1238,13 +1272,10 @@ impl SessionExecutor {
         let execution_timeout = self.execution_timeout;
         let fuel_limit = self.fuel_limit;
 
-        // Instantiate the component
-        let bindings = self
-            .executor
-            .instance_pre()
-            .instantiate_async(&mut store)
-            .await
-            .map_err(|e| Error::WasmEngine(format!("Failed to reinstantiate component: {e}")))?;
+        // Instantiate the component and keep both raw and typed handles.
+        let (instance, bindings) =
+            Self::instantiate_component(&self.executor, &mut store, "reinstantiate component")
+                .await?;
 
         // Re-apply the result-capture variable name on the fresh instance.
         if self.executor.result_variable() != "result" {
@@ -1260,6 +1291,7 @@ impl SessionExecutor {
 
         self.store = Some(store);
         self.bindings = Some(bindings);
+        self.instance = Some(instance);
         self.execution_count = 0;
         self.execution_timeout = execution_timeout;
         self.fuel_limit = fuel_limit;
@@ -1293,6 +1325,37 @@ impl SessionExecutor {
         self.store.as_mut()
     }
 
+    /// Return the root component export kind for `name`, if the component
+    /// exports it.
+    ///
+    /// This is a fork-facing introspection hook for PRD 010. It helps separate
+    /// component-level exports (`execute`, `snapshot-state`, etc.) from the core
+    /// Wasm memory, which is not a normal root component export in the current
+    /// runtime shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store or component instance is unavailable.
+    pub fn root_component_export_kind(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<&'static str>, Error> {
+        let mut store = self
+            .store
+            .take()
+            .ok_or_else(|| Error::WasmEngine("Store not available".to_string()))?;
+        let instance = self
+            .instance
+            .ok_or_else(|| Error::WasmEngine("Component instance not available".to_string()))?;
+
+        let kind = instance
+            .get_export(&mut store, None, name)
+            .map(|(item, _)| component_item_kind(&item));
+
+        self.store = Some(store);
+        Ok(kind)
+    }
+
     // =========================================================================
     // State Snapshot Methods (WIT Export Approach)
     // =========================================================================
@@ -1321,6 +1384,28 @@ impl SessionExecutor {
     /// println!("Snapshot size: {} bytes", snapshot.size());
     /// ```
     pub async fn snapshot_state(&mut self) -> Result<PythonStateSnapshot, Error> {
+        self.snapshot_state_with_limit(true).await
+    }
+
+    /// Capture a snapshot of the current Python session state without enforcing
+    /// [`MAX_SNAPSHOT_SIZE`].
+    ///
+    /// This is intended for measurement and migration experiments where the
+    /// caller needs to inspect snapshot density above the default safety cap.
+    /// Production callers should prefer [`Self::snapshot_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WASM call fails or Python state serialization
+    /// fails.
+    pub async fn snapshot_state_no_cap(&mut self) -> Result<PythonStateSnapshot, Error> {
+        self.snapshot_state_with_limit(false).await
+    }
+
+    async fn snapshot_state_with_limit(
+        &mut self,
+        enforce_size_limit: bool,
+    ) -> Result<PythonStateSnapshot, Error> {
         // Take ownership of store and bindings
         let mut store = self
             .store
@@ -1352,7 +1437,7 @@ impl SessionExecutor {
         let data = inner_result.map_err(Error::Snapshot)?;
 
         // Check size limit
-        if data.len() > MAX_SNAPSHOT_SIZE {
+        if enforce_size_limit && data.len() > MAX_SNAPSHOT_SIZE {
             return Err(Error::Snapshot(format!(
                 "Snapshot too large: {} bytes (max {} bytes)",
                 data.len(),

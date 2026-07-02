@@ -34,7 +34,7 @@ use crate::cache::{CacheKey, InstancePreCache};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use wasmtime::component::{Accessor, Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{AsContextMut, Config, Engine, ResourceLimiter, Store};
+use wasmtime::{AsContextMut, Config, Engine, MemoryCreator, ResourceLimiter, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::callback::Callback;
@@ -1150,6 +1150,18 @@ impl std::fmt::Debug for PythonExecutor {
 }
 
 impl PythonExecutor {
+    fn from_component(engine: Engine, component: Component) -> std::result::Result<Self, Error> {
+        let instance_pre = Self::create_instance_pre(&engine, &component)?;
+
+        Ok(Self {
+            engine,
+            instance_pre,
+            python_stdlib_path: None,
+            python_site_packages_paths: Vec::new(),
+            result_variable: "result".to_string(),
+        })
+    }
+
     /// Get a reference to the wasmtime engine.
     #[must_use]
     pub fn engine(&self) -> &Engine {
@@ -1269,15 +1281,34 @@ impl PythonExecutor {
         let engine = Self::shared_engine()?;
         let component =
             Component::from_binary(&engine, wasm_bytes).map_err(Error::WasmComponent)?;
-        let instance_pre = Self::create_instance_pre(&engine, &component)?;
+        Self::from_component(engine, component)
+    }
 
-        Ok(Self {
-            engine,
-            instance_pre,
-            python_stdlib_path: None,
-            python_site_packages_paths: Vec::new(),
-            result_variable: "result".to_string(),
-        })
+    /// Create a new executor with a caller-provided host memory creator.
+    ///
+    /// This is an experimental PRD 010 hook for linear-memory snapshot research.
+    /// It bypasses the global shared engine and instance-pre cache because the
+    /// engine configuration owns the `MemoryCreator`. The normal constructors
+    /// should be preferred for production use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WASM component cannot be loaded, the wasmtime
+    /// engine cannot be configured, or the provided memory creator is rejected.
+    #[tracing::instrument(
+        name = "PythonExecutor::from_binary_with_memory_creator",
+        skip(wasm_bytes, memory_creator),
+        fields(wasm_bytes_len = wasm_bytes.len())
+    )]
+    pub fn from_binary_with_memory_creator(
+        wasm_bytes: &[u8],
+        memory_creator: Arc<dyn MemoryCreator>,
+    ) -> std::result::Result<Self, Error> {
+        let engine =
+            Self::create_engine_with_target_and_memory_creator(None, Some(memory_creator))?;
+        let component =
+            Component::from_binary(&engine, wasm_bytes).map_err(Error::WasmComponent)?;
+        Self::from_component(engine, component)
     }
 
     /// Create a new executor by loading a WASM component from a file.
@@ -1297,15 +1328,33 @@ impl PythonExecutor {
         let engine = Self::shared_engine()?;
         let component =
             Component::from_file(&engine, path.as_ref()).map_err(Error::WasmComponent)?;
-        let instance_pre = Self::create_instance_pre(&engine, &component)?;
+        Self::from_component(engine, component)
+    }
 
-        Ok(Self {
-            engine,
-            instance_pre,
-            python_stdlib_path: None,
-            python_site_packages_paths: Vec::new(),
-            result_variable: "result".to_string(),
-        })
+    /// Create a new executor from a file with a caller-provided host memory
+    /// creator.
+    ///
+    /// See [`Self::from_binary_with_memory_creator`] for why this bypasses the
+    /// shared engine/cache path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, the WASM component cannot be
+    /// loaded, or the custom engine cannot be configured.
+    #[tracing::instrument(
+        name = "PythonExecutor::from_file_with_memory_creator",
+        skip(memory_creator),
+        fields(path = %path.as_ref().display())
+    )]
+    pub fn from_file_with_memory_creator(
+        path: impl AsRef<std::path::Path>,
+        memory_creator: Arc<dyn MemoryCreator>,
+    ) -> std::result::Result<Self, Error> {
+        let engine =
+            Self::create_engine_with_target_and_memory_creator(None, Some(memory_creator))?;
+        let component =
+            Component::from_file(&engine, path.as_ref()).map_err(Error::WasmComponent)?;
+        Self::from_component(engine, component)
     }
 
     /// Create a new executor by loading a pre-compiled component from bytes.
@@ -1333,15 +1382,37 @@ impl PythonExecutor {
         // created by `precompile()` with a compatible engine configuration.
         let component = unsafe { Component::deserialize(&engine, precompiled_bytes) }
             .map_err(Error::WasmComponent)?;
-        let instance_pre = Self::create_instance_pre(&engine, &component)?;
+        Self::from_component(engine, component)
+    }
 
-        Ok(Self {
-            engine,
-            instance_pre,
-            python_stdlib_path: None,
-            python_site_packages_paths: Vec::new(),
-            result_variable: "result".to_string(),
-        })
+    /// Create a new executor by loading pre-compiled component bytes with a
+    /// caller-provided host memory creator.
+    ///
+    /// This is intended only for PRD 010 memory-hook experiments. It bypasses
+    /// the shared engine/cache path, and the pre-compiled bytes must have been
+    /// produced with a compatible engine configuration.
+    ///
+    /// # Safety
+    ///
+    /// This has the same safety requirements as [`Self::from_precompiled`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes are invalid, incompatible, or the custom
+    /// engine cannot be configured.
+    #[cfg(any(feature = "embedded", feature = "preinit"))]
+    #[allow(unsafe_code)]
+    pub unsafe fn from_precompiled_with_memory_creator(
+        precompiled_bytes: &[u8],
+        memory_creator: Arc<dyn MemoryCreator>,
+    ) -> std::result::Result<Self, Error> {
+        let engine =
+            Self::create_engine_with_target_and_memory_creator(None, Some(memory_creator))?;
+        // SAFETY: Caller guarantees the precompiled bytes are trusted and were
+        // created by `precompile()` with a compatible engine configuration.
+        let component = unsafe { Component::deserialize(&engine, precompiled_bytes) }
+            .map_err(Error::WasmComponent)?;
+        Self::from_component(engine, component)
     }
 
     /// Create a new executor by loading a pre-compiled component from a file.
@@ -1382,15 +1453,37 @@ impl PythonExecutor {
             #[allow(unsafe_code)]
             let component = unsafe { Component::deserialize_file(&engine, path.as_ref()) }
                 .map_err(Error::WasmComponent)?;
-            let instance_pre = Self::create_instance_pre(&engine, &component)?;
-            Ok(Self {
-                engine,
-                instance_pre,
-                python_stdlib_path: None,
-                python_site_packages_paths: Vec::new(),
-                result_variable: "result".to_string(),
-            })
+            Self::from_component(engine, component)
         }
+    }
+
+    /// Create a new executor by loading a pre-compiled component file with a
+    /// caller-provided host memory creator.
+    ///
+    /// This bypasses the shared engine and `InstancePreCache` because the custom
+    /// memory creator is attached to the engine configuration.
+    ///
+    /// # Safety
+    ///
+    /// This has the same safety requirements as [`Self::from_precompiled_file`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, the pre-compiled component is
+    /// invalid/incompatible, or the custom engine cannot be configured.
+    #[cfg(any(feature = "embedded", feature = "preinit"))]
+    #[allow(unsafe_code)]
+    pub unsafe fn from_precompiled_file_with_memory_creator(
+        path: impl AsRef<std::path::Path>,
+        memory_creator: Arc<dyn MemoryCreator>,
+    ) -> std::result::Result<Self, Error> {
+        let engine =
+            Self::create_engine_with_target_and_memory_creator(None, Some(memory_creator))?;
+        // SAFETY: Caller guarantees the precompiled file is trusted and was
+        // created with a compatible engine configuration.
+        let component = unsafe { Component::deserialize_file(&engine, path.as_ref()) }
+            .map_err(Error::WasmComponent)?;
+        Self::from_component(engine, component)
     }
 
     /// Create a new executor by loading a pre-compiled component from a file,
@@ -1510,6 +1603,41 @@ impl PythonExecutor {
         #[allow(unsafe_code)]
         let mut executor =
             unsafe { Self::from_precompiled_file_with_key(resources.runtime(), cache_key)? };
+
+        executor.python_stdlib_path = stdlib_path;
+        Ok(executor)
+    }
+
+    /// Create a new executor from the embedded runtime with a caller-provided
+    /// host memory creator.
+    ///
+    /// This is the embedded-runtime variant of
+    /// [`Self::from_binary_with_memory_creator`] for PRD 010 experiments. It
+    /// intentionally bypasses the global `InstancePreCache`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if embedded resources cannot be extracted, the
+    /// pre-compiled runtime cannot be loaded, or the custom engine cannot be
+    /// configured.
+    #[cfg(feature = "embedded")]
+    #[tracing::instrument(
+        name = "PythonExecutor::from_embedded_runtime_with_memory_creator",
+        skip(memory_creator)
+    )]
+    pub fn from_embedded_runtime_with_memory_creator(
+        memory_creator: Arc<dyn MemoryCreator>,
+    ) -> std::result::Result<Self, Error> {
+        let resources = crate::embedded::EmbeddedResources::get()?;
+        let stdlib_path = Some(resources.stdlib_path.clone());
+        let wasm_bytes =
+            crate::embedded::EmbeddedResources::runtime_wasm_bytes().ok_or_else(|| {
+                Error::Initialization(
+                    "embedded runtime.wasm is unavailable for tracking-memory executor".to_string(),
+                )
+            })?;
+
+        let mut executor = Self::from_binary_with_memory_creator(wasm_bytes, memory_creator)?;
 
         executor.python_stdlib_path = stdlib_path;
         Ok(executor)
@@ -1709,6 +1837,13 @@ impl PythonExecutor {
     /// list of `flag=value` pairs. Example:
     /// `ERYX_CRANELIFT_FLAGS=has_avx512f=false,has_avx512bw=false`
     fn create_engine_with_target(target: Option<&str>) -> std::result::Result<Engine, Error> {
+        Self::create_engine_with_target_and_memory_creator(target, None)
+    }
+
+    fn create_engine_with_target_and_memory_creator(
+        target: Option<&str>,
+        memory_creator: Option<Arc<dyn MemoryCreator>>,
+    ) -> std::result::Result<Engine, Error> {
         let mut config = Config::new();
         config.wasm_component_model(true);
         // Enable component model async for the `invoke` callback function.
@@ -1728,9 +1863,11 @@ impl PythonExecutor {
         // tracked and reported for billing/metering purposes.
         config.consume_fuel(true);
 
-        // Enable copy-on-write heap images for faster instantiation
-        // This defers memory initialization from instantiation time to first write
-        config.memory_init_cow(true);
+        // Enable copy-on-write heap images for faster instantiation. Custom
+        // host-memory creators cannot currently host Wasmtime's memory-image
+        // mmap slots, so PRD 010 tracking-memory experiments use the explicit
+        // initializer-copy path instead.
+        config.memory_init_cow(memory_creator.is_none());
 
         // Optimize for smaller generated code (slight runtime perf tradeoff)
         // This reduces .cwasm file sizes and memory footprint
@@ -1739,6 +1876,10 @@ impl PythonExecutor {
         // Reduce async stack size from default 2 MiB to 512 KiB
         // Python scripts don't need deep call stacks
         config.async_stack_size(512 * 1024);
+
+        if let Some(memory_creator) = memory_creator {
+            config.with_host_memory(memory_creator);
+        }
 
         // Configure target triple for cross-compilation or portable builds.
         // Check explicit parameter first, then environment variable, then use native.
