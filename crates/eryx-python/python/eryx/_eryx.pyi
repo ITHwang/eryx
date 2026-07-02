@@ -462,6 +462,7 @@ class Sandbox:
         on_stdout: Optional[Callable[[str], None]] = None,
         on_stderr: Optional[Callable[[str], None]] = None,
         result_variable: Optional[str] = None,
+        track_linear_memory: bool = False,
     ) -> None:
         """Create a new sandbox with the embedded Python runtime.
 
@@ -853,6 +854,9 @@ class Session:
             mcp: Optional MCPManager with connected MCP servers.
             on_stdout: Optional callback for streaming stdout output in real-time.
             on_stderr: Optional callback for streaming stderr output in real-time.
+            track_linear_memory: Experimental PRD 010 option that allocates Wasm
+                linear memories through a host tracker for capture-only snapshot
+                density checks.
 
         Raises:
             InitializationError: If the session fails to initialize.
@@ -948,6 +952,59 @@ class Session:
             # Save snapshot to file
             with open('state.bin', 'wb') as f:
                 f.write(snapshot)
+        """
+        ...
+
+    def snapshot_state_no_cap(self) -> bytes:
+        """Capture a snapshot of the current Python state without the default size cap.
+
+        This method is intended for snapshot-density measurements and migration
+        experiments. Prefer `snapshot_state()` for normal application use.
+
+        Returns:
+            The serialized snapshot data as bytes.
+
+        Raises:
+            ExecutionError: If the state cannot be serialized.
+        """
+        ...
+
+    @property
+    def linear_memory_tracking_enabled(self) -> bool:
+        """Whether experimental linear-memory tracking is enabled for this session."""
+        ...
+
+    def linear_memory_stats(self) -> dict[str, int]:
+        """Return aggregate stats for host-managed Wasm linear memories.
+
+        Requires ``Session(track_linear_memory=True)``.
+        """
+        ...
+
+    def linear_memory_regions(self) -> list[dict[str, int]]:
+        """Return metadata for live host-managed Wasm linear-memory regions.
+
+        Requires ``Session(track_linear_memory=True)``. This does not copy memory
+        bytes.
+        """
+        ...
+
+    def snapshot_linear_memory_regions(self) -> list[dict[str, Any]]:
+        """Copy live host-managed Wasm linear-memory regions.
+
+        Requires ``Session(track_linear_memory=True)``. This is capture-only and
+        not a full restore primitive.
+        """
+        ...
+
+    def restore_linear_memory_regions(
+        self, regions: list[dict[str, Any]]
+    ) -> dict[str, int]:
+        """Restore bytes into live host-managed Wasm linear-memory regions.
+
+        Requires ``Session(track_linear_memory=True)``. This is an in-place
+        restore probe for PRD 010, not a full restore primitive for a new
+        instance.
         """
         ...
 

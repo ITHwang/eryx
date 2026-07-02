@@ -269,6 +269,18 @@ impl<'a> InProcessSession<'a> {
         self.executor.snapshot_state().await
     }
 
+    /// Capture a snapshot of the current Python session state without enforcing
+    /// the default size cap.
+    ///
+    /// See [`SessionExecutor::snapshot_state_no_cap`] for details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot cannot be captured.
+    pub async fn snapshot_state_no_cap(&mut self) -> Result<PythonStateSnapshot, Error> {
+        self.executor.snapshot_state_no_cap().await
+    }
+
     /// Restore Python session state from a previously captured snapshot.
     ///
     /// See [`SessionExecutor::restore_state`] for details.
@@ -278,6 +290,21 @@ impl<'a> InProcessSession<'a> {
     /// Returns an error if the restore fails.
     pub async fn restore_state(&mut self, snapshot: &PythonStateSnapshot) -> Result<(), Error> {
         self.executor.restore_state(snapshot).await
+    }
+
+    /// Return the root component export kind for `name`, if the component
+    /// exports it.
+    ///
+    /// See [`SessionExecutor::root_component_export_kind`] for details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store or component instance is unavailable.
+    pub fn root_component_export_kind(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<&'static str>, Error> {
+        self.executor.root_component_export_kind(name)
     }
 
     /// Clear all persistent state from the session.

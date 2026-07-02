@@ -10,7 +10,7 @@ use std::time::Duration;
 use eryx::Callback;
 use eryx::OutputHandler;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict, PyList};
 use tokio::sync::mpsc;
 
 use crate::callback::extract_callbacks;
@@ -69,6 +69,9 @@ pub struct Session {
     net_config: Option<eryx::NetConfig>,
     /// Output handler for streaming stdout/stderr.
     output_handler: Option<Arc<dyn OutputHandler>>,
+    /// Experimental PRD 010 tracker for host-managed Wasm linear memories.
+    #[cfg(unix)]
+    host_memory_tracker: Option<Arc<eryx::host_memory::HostMemoryTracker>>,
 }
 
 #[pymethods]
@@ -112,7 +115,7 @@ impl Session {
     ///         {"name": "get_time", "fn": get_time, "description": "Returns current time"}
     ///     ])
     #[new]
-    #[pyo3(signature = (*, vfs=None, vfs_mount_path=None, execution_timeout_ms=None, max_fuel=None, network=None, callbacks=None, mcp=None, volumes=None, on_stdout=None, on_stderr=None, result_variable=None))]
+    #[pyo3(signature = (*, vfs=None, vfs_mount_path=None, execution_timeout_ms=None, max_fuel=None, network=None, callbacks=None, mcp=None, volumes=None, on_stdout=None, on_stderr=None, result_variable=None, track_linear_memory=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -127,6 +130,7 @@ impl Session {
         on_stdout: Option<Py<PyAny>>,
         on_stderr: Option<Py<PyAny>>,
         result_variable: Option<String>,
+        track_linear_memory: bool,
     ) -> PyResult<Self> {
         // Create a tokio runtime for async execution
         let runtime = Arc::new(
@@ -138,9 +142,36 @@ impl Session {
                 })?,
         );
 
-        // Create the PythonExecutor from embedded runtime
-        let mut executor = eryx::PythonExecutor::from_embedded_runtime()
-            .map_err(|e| InitializationError::new_err(format!("failed to create executor: {e}")))?;
+        // Create the PythonExecutor from embedded runtime.
+        #[cfg(unix)]
+        let (mut executor, host_memory_tracker) = if track_linear_memory {
+            let creator = eryx::host_memory::TrackingMemoryCreator::new();
+            let tracker = creator.tracker();
+            let executor =
+                eryx::PythonExecutor::from_embedded_runtime_with_memory_creator(Arc::new(creator))
+                    .map_err(|e| {
+                        InitializationError::new_err(format!(
+                            "failed to create tracked-memory executor: {e}"
+                        ))
+                    })?;
+            (executor, Some(tracker))
+        } else {
+            let executor = eryx::PythonExecutor::from_embedded_runtime().map_err(|e| {
+                InitializationError::new_err(format!("failed to create executor: {e}"))
+            })?;
+            (executor, None)
+        };
+        #[cfg(not(unix))]
+        let mut executor = {
+            if track_linear_memory {
+                return Err(InitializationError::new_err(
+                    "track_linear_memory is only supported on Unix platforms",
+                ));
+            }
+            eryx::PythonExecutor::from_embedded_runtime().map_err(|e| {
+                InitializationError::new_err(format!("failed to create executor: {e}"))
+            })?
+        };
         if let Some(name) = result_variable {
             executor = executor.with_result_variable(name);
         }
@@ -248,6 +279,8 @@ impl Session {
             callbacks: callbacks_map,
             net_config,
             output_handler,
+            #[cfg(unix)]
+            host_memory_tracker,
         };
 
         // Set execution timeout if provided
@@ -481,6 +514,212 @@ impl Session {
         Ok(PyBytes::new(py, snapshot.to_bytes().as_slice()))
     }
 
+    /// Capture a snapshot of the current Python state without the default size cap.
+    ///
+    /// This method is intended for snapshot-density measurements and migration
+    /// experiments. Prefer `snapshot_state()` for normal application use.
+    ///
+    /// Returns:
+    ///     bytes: The serialized snapshot data.
+    ///
+    /// Raises:
+    ///     ExecutionError: If the state cannot be serialized.
+    fn snapshot_state_no_cap<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let runtime = self.runtime.clone();
+
+        let snapshot = py.detach(|| {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| InitializationError::new_err("session lock poisoned"))?;
+            let inner = guard
+                .as_mut()
+                .ok_or_else(|| InitializationError::new_err("session is not initialized"))?;
+
+            runtime
+                .block_on(inner.snapshot_state_no_cap())
+                .map_err(eryx_error_to_py)
+        })?;
+
+        Ok(PyBytes::new(py, snapshot.to_bytes().as_slice()))
+    }
+
+    /// Whether this session was created with experimental linear-memory tracking.
+    #[getter]
+    fn linear_memory_tracking_enabled(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.host_memory_tracker.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Return aggregate stats for host-managed Wasm linear memories.
+    ///
+    /// This is an experimental PRD 010 hook. It is only populated when the
+    /// session is created with `track_linear_memory=True`.
+    fn linear_memory_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        #[cfg(unix)]
+        {
+            let tracker = self.linear_memory_tracker()?;
+            let stats = tracker.stats();
+            let dict = PyDict::new(py);
+            dict.set_item("allocations", stats.allocations)?;
+            dict.set_item("deallocations", stats.deallocations)?;
+            dict.set_item("mapped_bytes", stats.mapped_bytes)?;
+            dict.set_item("peak_mapped_bytes", stats.peak_mapped_bytes)?;
+            dict.set_item("accessible_bytes", stats.accessible_bytes)?;
+            dict.set_item("peak_accessible_bytes", stats.peak_accessible_bytes)?;
+            dict.set_item("grow_count", stats.grow_count)?;
+            Ok(dict)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = py;
+            Err(InitializationError::new_err(
+                "linear-memory tracking is only supported on Unix platforms",
+            ))
+        }
+    }
+
+    /// Return metadata for live host-managed Wasm linear-memory regions.
+    ///
+    /// This does not copy memory bytes.
+    fn linear_memory_regions<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        #[cfg(unix)]
+        {
+            let tracker = self.linear_memory_tracker()?;
+            tracker
+                .live_regions()
+                .into_iter()
+                .map(|region| {
+                    let dict = PyDict::new(py);
+                    dict.set_item("id", region.id)?;
+                    dict.set_item("base_addr", region.base_addr)?;
+                    dict.set_item("byte_size", region.byte_size)?;
+                    dict.set_item("byte_capacity", region.byte_capacity)?;
+                    dict.set_item("accessible_bytes", region.accessible_bytes)?;
+                    dict.set_item("mapped_bytes", region.mapped_bytes)?;
+                    dict.set_item("guard_bytes", region.guard_bytes)?;
+                    Ok(dict)
+                })
+                .collect()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = py;
+            Err(InitializationError::new_err(
+                "linear-memory tracking is only supported on Unix platforms",
+            ))
+        }
+    }
+
+    /// Copy bytes from live host-managed Wasm linear-memory regions.
+    ///
+    /// Caller must use this only after `execute()` has returned and no guest code
+    /// can run concurrently. This is a capture-only PRD 010 feasibility hook; it
+    /// is not a full restore primitive.
+    fn snapshot_linear_memory_regions<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        #[cfg(unix)]
+        {
+            let tracker = self.linear_memory_tracker()?;
+            tracker
+                .snapshot_live_regions()
+                .into_iter()
+                .map(|region| {
+                    let dict = PyDict::new(py);
+                    dict.set_item("id", region.id)?;
+                    dict.set_item("byte_capacity", region.byte_capacity)?;
+                    dict.set_item("byte_size", region.bytes.len())?;
+                    dict.set_item("bytes", PyBytes::new(py, &region.bytes))?;
+                    Ok(dict)
+                })
+                .collect()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = py;
+            Err(InitializationError::new_err(
+                "linear-memory tracking is only supported on Unix platforms",
+            ))
+        }
+    }
+
+    /// Restore bytes into the current live host-managed Wasm linear memories.
+    ///
+    /// Caller must use this only after `execute()` has returned and no guest code
+    /// can run concurrently. This is an in-place restore probe for PRD 010, not
+    /// a full restore primitive for a new instance.
+    fn restore_linear_memory_regions<'py>(
+        &self,
+        py: Python<'py>,
+        regions: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        #[cfg(unix)]
+        {
+            let tracker = self.linear_memory_tracker()?;
+            let list = regions.cast::<PyList>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "linear-memory regions must be a list of dicts",
+                )
+            })?;
+
+            let mut snapshots = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                let dict = item.cast::<PyDict>().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "linear-memory region entries must be dicts",
+                    )
+                })?;
+                let id = dict
+                    .get_item("id")?
+                    .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing 'id'"))?
+                    .extract()?;
+                let byte_capacity = dict
+                    .get_item("byte_capacity")?
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyKeyError::new_err("missing 'byte_capacity'")
+                    })?
+                    .extract()?;
+                let bytes = dict
+                    .get_item("bytes")?
+                    .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing 'bytes'"))?;
+                let bytes = bytes.cast::<PyBytes>().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "linear-memory region 'bytes' must be bytes",
+                    )
+                })?;
+                snapshots.push(eryx::host_memory::HostMemoryRegionSnapshot {
+                    id,
+                    byte_capacity,
+                    bytes: bytes.as_bytes().to_vec(),
+                });
+            }
+
+            let stats = tracker
+                .restore_live_regions(&snapshots)
+                .map_err(InitializationError::new_err)?;
+            let dict = PyDict::new(py);
+            dict.set_item("restored_regions", stats.restored_regions)?;
+            dict.set_item("restored_bytes", stats.restored_bytes)?;
+            Ok(dict)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = py;
+            let _ = regions;
+            Err(InitializationError::new_err(
+                "linear-memory tracking is only supported on Unix platforms",
+            ))
+        }
+    }
+
     /// Restore Python state from a previously captured snapshot.
     ///
     /// Args:
@@ -624,6 +863,15 @@ impl Session {
             String::new()
         };
         format!("Session(execution_count={}{})", count, vfs_info)
+    }
+}
+
+impl Session {
+    #[cfg(unix)]
+    fn linear_memory_tracker(&self) -> PyResult<Arc<eryx::host_memory::HostMemoryTracker>> {
+        self.host_memory_tracker.clone().ok_or_else(|| {
+            InitializationError::new_err("session was not created with track_linear_memory=True")
+        })
     }
 }
 

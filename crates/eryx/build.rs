@@ -7,6 +7,10 @@
 //! 1. `ERYX_RUNTIME_CWASM` env var (explicit path)
 //! 2. `~/.cache/eryx/runtime-v<version>*.cwasm` (populated by `eryx-precompile setup`)
 //! 3. `../eryx-runtime/runtime.cwasm` (workspace dev workflow)
+//!
+//! The PRD 010 tracking-memory experiment also embeds `runtime.wasm` when it is
+//! available in the workspace or via `ERYX_RUNTIME_WASM`. The normal runtime
+//! path does not require it.
 
 // Build scripts should panic on errors, so expect/unwrap are appropriate here.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -61,15 +65,21 @@ mod embedded_runtime {
 
         // Rebuild when env var or source files change
         println!("cargo::rerun-if-env-changed=ERYX_RUNTIME_CWASM");
+        println!("cargo::rerun-if-env-changed=ERYX_RUNTIME_WASM");
         println!("cargo::rerun-if-env-changed=DOCS_RS");
         println!("cargo::rerun-if-changed=../eryx-runtime/runtime.cwasm");
+        println!("cargo::rerun-if-changed=../eryx-runtime/runtime.wasm");
 
         // docs.rs sandbox: no WASM artifacts available, write empty placeholder
         if std::env::var("DOCS_RS").is_ok() {
-            let dest = out_dir.join("runtime.cwasm");
-            std::fs::write(&dest, b"").expect("Failed to write docs.rs placeholder runtime.cwasm");
+            std::fs::write(out_dir.join("runtime.cwasm"), b"")
+                .expect("Failed to write docs.rs placeholder runtime.cwasm");
+            std::fs::write(out_dir.join("runtime.wasm"), b"")
+                .expect("Failed to write docs.rs placeholder runtime.wasm");
             return;
         }
+
+        prepare_runtime_wasm(&out_dir);
 
         // 1. Explicit env var
         let cwasm_path = std::env::var("ERYX_RUNTIME_CWASM")
@@ -118,6 +128,21 @@ mod embedded_runtime {
                     "
                 );
             }
+        }
+    }
+
+    fn prepare_runtime_wasm(out_dir: &std::path::Path) {
+        let wasm_path = std::env::var("ERYX_RUNTIME_WASM")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| Some(PathBuf::from("../eryx-runtime/runtime.wasm")).filter(|p| p.exists()));
+
+        let dest = out_dir.join("runtime.wasm");
+        if let Some(path) = wasm_path {
+            std::fs::copy(&path, &dest).expect("Failed to copy runtime.wasm");
+        } else {
+            std::fs::write(&dest, b"").expect("Failed to write placeholder runtime.wasm");
         }
     }
 }
