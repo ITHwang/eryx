@@ -830,6 +830,8 @@ class Session:
         vfs: Optional[VfsStorage] = None,
         vfs_mount_path: Optional[str] = None,
         execution_timeout_ms: Optional[int] = None,
+        callback_timeout_ms: Optional[int] = 10000,
+        max_fuel: Optional[int] = None,
         network: Optional[NetConfig] = None,
         callbacks: Optional[Union[CallbackRegistry, Sequence[CallbackDict]]] = None,
         mcp: Optional[MCPManager] = None,
@@ -837,6 +839,8 @@ class Session:
         on_stdout: Optional[Callable[[str], None]] = None,
         on_stderr: Optional[Callable[[str], None]] = None,
         result_variable: Optional[str] = None,
+        track_linear_memory: bool = False,
+        linear_memory_initial_bytes: Optional[int] = None,
     ) -> None:
         """Create a new session with the embedded Python runtime.
 
@@ -848,6 +852,8 @@ class Session:
                 Files written to `/data/*` will persist across executions.
             vfs_mount_path: Custom mount path for VFS (default: "/data").
             execution_timeout_ms: Optional timeout in milliseconds for each execution.
+            callback_timeout_ms: Optional timeout in milliseconds for each host callback.
+            max_fuel: Optional max WASM fuel per execution.
             network: Optional network configuration. If provided, enables networking.
             callbacks: Optional callbacks that sandboxed code can invoke.
                 Can be a CallbackRegistry or a list of callback dicts.
@@ -857,6 +863,10 @@ class Session:
             track_linear_memory: Experimental PRD 010 option that allocates Wasm
                 linear memories through a host tracker for capture-only snapshot
                 density checks.
+            linear_memory_initial_bytes: Experimental PRD 010 restore-spike option
+                that host-shapes a fresh tracked session to at least this byte
+                length before any guest code executes. Requires
+                ``track_linear_memory=True``.
 
         Raises:
             InitializationError: If the session fails to initialize.
@@ -1005,6 +1015,24 @@ class Session:
         Requires ``Session(track_linear_memory=True)``. This is an in-place
         restore probe for PRD 010, not a full restore primitive for a new
         instance.
+        """
+        ...
+
+    def restore_linear_memory_regions_growing(
+        self, regions: list[dict[str, Any]]
+    ) -> dict[str, int]:
+        """Fail-loud metadata-only grow probe for fresh-session restore.
+
+        Requires ``Session(track_linear_memory=True)``. This path does not
+        update Wasmtime VM memory length when growth is needed; create a fresh
+        tracked session with ``linear_memory_initial_bytes`` instead.
+        """
+        ...
+
+    def root_component_export_kind(self, name: str) -> Optional[str]:
+        """Return the root component export kind for a given export name.
+
+        This is a PRD 010 host-side introspection hook.
         """
         ...
 
