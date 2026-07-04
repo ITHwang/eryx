@@ -91,7 +91,7 @@ pub struct HostMemoryTracker {
     accessible_bytes: AtomicUsize,
     peak_accessible_bytes: AtomicUsize,
     grow_count: AtomicU64,
-    regions: Mutex<HashMap<u64, RegionRecord>>,
+    regions: Mutex<HashMap<u64, Arc<Mutex<RegionRecord>>>>,
 }
 
 impl HostMemoryTracker {
@@ -119,14 +119,17 @@ impl HostMemoryTracker {
 
         regions
             .iter()
-            .map(|(id, region)| HostMemoryRegion {
-                id: *id,
-                base_addr: region.base_addr,
-                byte_size: region.byte_size,
-                byte_capacity: region.byte_capacity,
-                accessible_bytes: region.accessible_bytes,
-                mapped_bytes: region.mapped_bytes,
-                guard_bytes: region.guard_bytes,
+            .map(|(id, region)| {
+                let region = region.lock().expect("host memory region lock poisoned");
+                HostMemoryRegion {
+                    id: *id,
+                    base_addr: region.base_addr,
+                    byte_size: region.byte_size,
+                    byte_capacity: region.byte_capacity,
+                    accessible_bytes: region.accessible_bytes,
+                    mapped_bytes: region.mapped_bytes,
+                    guard_bytes: region.guard_bytes,
+                }
             })
             .collect()
     }
@@ -146,6 +149,7 @@ impl HostMemoryTracker {
         regions
             .iter()
             .map(|(id, region)| {
+                let region = region.lock().expect("host memory region lock poisoned");
                 let bytes = if region.byte_size == 0 {
                     Vec::new()
                 } else {
@@ -190,6 +194,7 @@ impl HostMemoryTracker {
             let region = regions
                 .get(&snapshot.id)
                 .ok_or_else(|| format!("linear-memory region {} is not live", snapshot.id))?;
+            let region = region.lock().expect("host memory region lock poisoned");
 
             if snapshot.bytes.len() != region.byte_size {
                 return Err(format!(
@@ -225,6 +230,78 @@ impl HostMemoryTracker {
         Ok(restored)
     }
 
+    /// Negative metadata-only grow probe for fresh-session restore.
+    ///
+    /// This method is kept only to fail loudly for the path that PRD 010 proved
+    /// unsafe: changing tracker metadata without updating Wasmtime's
+    /// `VMMemoryDefinition.current_length`. Use [`restore_live_regions`] after
+    /// creating a fresh session with [`TrackingMemoryCreator::new_with_initial_size_floor`].
+    #[allow(unsafe_code)]
+    pub fn restore_live_regions_growing(
+        &self,
+        snapshots: &[HostMemoryRegionSnapshot],
+    ) -> Result<HostMemoryRestoreStats, String> {
+        let regions = self
+            .regions
+            .lock()
+            .expect("host memory region lock poisoned");
+
+        let mut restored = HostMemoryRestoreStats::default();
+        for snapshot in snapshots {
+            let region = regions
+                .get(&snapshot.id)
+                .ok_or_else(|| format!("linear-memory region {} is not live", snapshot.id))?;
+            let region = region.lock().expect("host memory region lock poisoned");
+
+            if snapshot.byte_capacity != region.byte_capacity {
+                return Err(format!(
+                    "linear-memory region {} capacity mismatch: snapshot={} live={}",
+                    snapshot.id, snapshot.byte_capacity, region.byte_capacity
+                ));
+            }
+
+            let snapshot_size = snapshot.bytes.len();
+            if snapshot_size > region.byte_capacity {
+                return Err(format!(
+                    "linear-memory region {} snapshot size {} exceeds live capacity {}",
+                    snapshot.id, snapshot_size, region.byte_capacity
+                ));
+            }
+            if snapshot_size < region.byte_size {
+                return Err(format!(
+                    "linear-memory region {} cannot shrink live memory: snapshot={} live={}",
+                    snapshot.id, snapshot_size, region.byte_size
+                ));
+            }
+            if snapshot_size > region.byte_size {
+                return Err(
+                    "metadata-only live-region grow is unsupported: it changes tracker state \
+                     without updating Wasmtime VM memory length; create the restore target with \
+                     TrackingMemoryCreator::new_with_initial_size_floor instead"
+                        .to_string(),
+                );
+            }
+
+            if !snapshot.bytes.is_empty() {
+                // SAFETY: The region is live while held in the tracker map. It
+                // has been grown to exactly the snapshot byte size above. The
+                // caller guarantees no guest code can run or mutate memory
+                // concurrently.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        snapshot.bytes.as_ptr(),
+                        region.base_addr as *mut u8,
+                        snapshot.bytes.len(),
+                    );
+                }
+            }
+            restored.restored_regions += 1;
+            restored.restored_bytes += snapshot.bytes.len();
+        }
+
+        Ok(restored)
+    }
+
     fn record_allocation(
         &self,
         base_addr: usize,
@@ -233,7 +310,7 @@ impl HostMemoryTracker {
         accessible_bytes: usize,
         mapped_bytes: usize,
         guard_bytes: usize,
-    ) -> u64 {
+    ) -> (u64, Arc<Mutex<RegionRecord>>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         self.allocations.fetch_add(1, Ordering::Relaxed);
         add_with_peak(&self.mapped_bytes, &self.peak_mapped_bytes, mapped_bytes);
@@ -243,33 +320,29 @@ impl HostMemoryTracker {
             accessible_bytes,
         );
 
+        let region = Arc::new(Mutex::new(RegionRecord {
+            base_addr,
+            byte_size,
+            byte_capacity,
+            accessible_bytes,
+            mapped_bytes,
+            guard_bytes,
+        }));
+
         self.regions
             .lock()
             .expect("host memory region lock poisoned")
-            .insert(
-                id,
-                RegionRecord {
-                    base_addr,
-                    byte_size,
-                    byte_capacity,
-                    accessible_bytes,
-                    mapped_bytes,
-                    guard_bytes,
-                },
-            );
+            .insert(id, Arc::clone(&region));
 
-        id
+        (id, region)
     }
 
-    fn record_growth(&self, id: u64, byte_size: usize, accessible_bytes: usize) {
-        let mut regions = self
-            .regions
-            .lock()
-            .expect("host memory region lock poisoned");
-        let Some(region) = regions.get_mut(&id) else {
-            return;
-        };
-
+    fn record_growth_locked(
+        &self,
+        region: &mut RegionRecord,
+        byte_size: usize,
+        accessible_bytes: usize,
+    ) {
         if accessible_bytes > region.accessible_bytes {
             add_with_peak(
                 &self.accessible_bytes,
@@ -279,7 +352,40 @@ impl HostMemoryTracker {
         }
         region.byte_size = byte_size;
         region.accessible_bytes = accessible_bytes;
+    }
+
+    #[allow(unsafe_code)]
+    fn grow_region_record(&self, region: &mut RegionRecord, new_size: usize) -> Result<(), String> {
+        if new_size > region.byte_capacity {
+            return Err(format!(
+                "linear memory grow to {new_size} exceeds reserved capacity {}",
+                region.byte_capacity
+            ));
+        }
+
+        let page_size = page_size()?;
+        let new_accessible = round_up(new_size, page_size)?;
+        if new_accessible > region.accessible_bytes {
+            // SAFETY: new_accessible is bounded by byte_capacity, and the range
+            // starts at the mmap base owned by this live linear memory.
+            let rc = unsafe {
+                libc::mprotect(
+                    region.base_addr as *mut libc::c_void,
+                    new_accessible,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+            if rc != 0 {
+                return Err(format!(
+                    "mprotect failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        self.record_growth_locked(region, new_size, new_accessible);
         self.grow_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn record_deallocation(&self, id: u64) {
@@ -293,6 +399,7 @@ impl HostMemoryTracker {
         };
 
         self.deallocations.fetch_add(1, Ordering::Relaxed);
+        let region = region.lock().expect("host memory region lock poisoned");
         self.mapped_bytes
             .fetch_sub(region.mapped_bytes, Ordering::Relaxed);
         self.accessible_bytes
@@ -305,6 +412,7 @@ impl HostMemoryTracker {
 #[derive(Debug, Clone)]
 pub struct TrackingMemoryCreator {
     tracker: Arc<HostMemoryTracker>,
+    initial_size_floor: Option<usize>,
 }
 
 impl TrackingMemoryCreator {
@@ -313,6 +421,21 @@ impl TrackingMemoryCreator {
     pub fn new() -> Self {
         Self {
             tracker: Arc::new(HostMemoryTracker::default()),
+            initial_size_floor: None,
+        }
+    }
+
+    /// Create a new tracking memory creator whose fresh allocations start at
+    /// least `initial_size_floor` bytes.
+    ///
+    /// This is a PRD 010 restore spike hook. It lets the host instantiate a
+    /// fresh session with a linear-memory shape compatible with a captured
+    /// snapshot, without running guest code merely to grow memory.
+    #[must_use]
+    pub fn new_with_initial_size_floor(initial_size_floor: usize) -> Self {
+        Self {
+            tracker: Arc::new(HostMemoryTracker::default()),
+            initial_size_floor: Some(initial_size_floor),
         }
     }
 
@@ -342,6 +465,7 @@ unsafe impl MemoryCreator for TrackingMemoryCreator {
         let memory = TrackedLinearMemory::new(
             Arc::clone(&self.tracker),
             minimum,
+            self.initial_size_floor,
             maximum,
             reserved_size_in_bytes,
             guard_size_in_bytes,
@@ -354,10 +478,8 @@ unsafe impl MemoryCreator for TrackingMemoryCreator {
 struct TrackedLinearMemory {
     tracker: Arc<HostMemoryTracker>,
     id: u64,
+    state: Arc<Mutex<RegionRecord>>,
     base: NonNull<u8>,
-    byte_size: usize,
-    byte_capacity: usize,
-    accessible_bytes: usize,
     mapped_bytes: usize,
 }
 
@@ -372,17 +494,27 @@ impl TrackedLinearMemory {
     fn new(
         tracker: Arc<HostMemoryTracker>,
         minimum: usize,
+        initial_size_floor: Option<usize>,
         maximum: Option<usize>,
         reserved_size_in_bytes: Option<usize>,
         guard_size_in_bytes: usize,
     ) -> Result<Self, String> {
         let page_size = page_size()?;
+        let initial_size = initial_size_floor.unwrap_or(minimum).max(minimum);
+        if let Some(maximum) = maximum
+            && initial_size > maximum
+        {
+            return Err(format!(
+                "linear memory initial size {initial_size} exceeds maximum {maximum}"
+            ));
+        }
+
         let mut byte_capacity = reserved_size_in_bytes
             .or(maximum)
             .unwrap_or(minimum)
-            .max(minimum);
+            .max(initial_size);
         if let Some(maximum) = maximum {
-            byte_capacity = byte_capacity.min(maximum).max(minimum);
+            byte_capacity = byte_capacity.min(maximum).max(initial_size);
         }
         byte_capacity = round_up(byte_capacity, page_size)?;
 
@@ -419,7 +551,7 @@ impl TrackedLinearMemory {
         let base =
             NonNull::new(raw.cast::<u8>()).ok_or_else(|| "mmap returned null".to_string())?;
 
-        let accessible_bytes = round_up(minimum, page_size)?;
+        let accessible_bytes = round_up(initial_size, page_size)?;
         if accessible_bytes > 0 {
             // SAFETY: `base` refers to an mmap of at least `mapped_bytes`, and
             // accessible_bytes is bounded by byte_capacity.
@@ -440,9 +572,9 @@ impl TrackedLinearMemory {
             }
         }
 
-        let id = tracker.record_allocation(
+        let (id, state) = tracker.record_allocation(
             base.as_ptr() as usize,
-            minimum,
+            initial_size,
             byte_capacity,
             accessible_bytes,
             mapped_bytes,
@@ -452,10 +584,8 @@ impl TrackedLinearMemory {
         Ok(Self {
             tracker,
             id,
+            state,
             base,
-            byte_size: minimum,
-            byte_capacity,
-            accessible_bytes,
             mapped_bytes,
         })
     }
@@ -476,45 +606,24 @@ impl Drop for TrackedLinearMemory {
 #[allow(unsafe_code)]
 unsafe impl LinearMemory for TrackedLinearMemory {
     fn byte_size(&self) -> usize {
-        self.byte_size
+        self.state
+            .lock()
+            .expect("host memory region lock poisoned")
+            .byte_size
     }
 
     fn byte_capacity(&self) -> usize {
-        self.byte_capacity
+        self.state
+            .lock()
+            .expect("host memory region lock poisoned")
+            .byte_capacity
     }
 
     fn grow_to(&mut self, new_size: usize) -> wasmtime::Result<()> {
-        if new_size > self.byte_capacity {
-            return Err(wasmtime::Error::msg(format!(
-                "linear memory grow to {new_size} exceeds reserved capacity {}",
-                self.byte_capacity
-            )));
-        }
-
-        let page_size = page_size().map_err(wasmtime::Error::msg)?;
-        let new_accessible = round_up(new_size, page_size).map_err(wasmtime::Error::msg)?;
-        if new_accessible > self.accessible_bytes {
-            // SAFETY: new_accessible is bounded by byte_capacity, and the range
-            // starts at the mmap base.
-            let rc = unsafe {
-                libc::mprotect(
-                    self.base.as_ptr().cast(),
-                    new_accessible,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                )
-            };
-            if rc != 0 {
-                return Err(wasmtime::Error::msg(format!(
-                    "mprotect failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            self.accessible_bytes = new_accessible;
-        }
-
-        self.byte_size = new_size;
+        let mut state = self.state.lock().expect("host memory region lock poisoned");
         self.tracker
-            .record_growth(self.id, self.byte_size, self.accessible_bytes);
+            .grow_region_record(&mut state, new_size)
+            .map_err(wasmtime::Error::msg)?;
         Ok(())
     }
 
@@ -595,5 +704,25 @@ mod tests {
         drop(memory);
         assert_eq!(tracker.stats().deallocations, 1);
         assert!(tracker.live_regions().is_empty());
+    }
+
+    #[test]
+    fn tracking_memory_creator_can_start_at_initial_size_floor() {
+        let creator = TrackingMemoryCreator::new_with_initial_size_floor(8192);
+        let tracker = creator.tracker();
+
+        let memory = creator
+            .new_memory(
+                MemoryType::new(1, None),
+                4096,
+                Some(16384),
+                Some(16384),
+                4096,
+            )
+            .expect("memory allocation should succeed");
+
+        assert_eq!(memory.byte_size(), 8192);
+        assert_eq!(tracker.live_regions()[0].byte_size, 8192);
+        assert!(tracker.live_regions()[0].accessible_bytes >= 8192);
     }
 }
