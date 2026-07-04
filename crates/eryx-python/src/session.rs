@@ -63,6 +63,8 @@ pub struct Session {
     vfs_storage: Option<eryx::vfs::ArcStorage>,
     /// VFS mount path configuration.
     vfs_mount_path: Option<String>,
+    /// Optional timeout for one host callback invocation, in milliseconds.
+    callback_timeout_ms: Option<u64>,
     /// Callbacks available for this session.
     callbacks: Arc<HashMap<String, Arc<dyn eryx::Callback>>>,
     /// Network configuration for this session.
@@ -86,6 +88,7 @@ impl Session {
     ///         Files written to `/data/*` will persist across executions.
     ///     vfs_mount_path: Custom mount path for VFS (default: "/data").
     ///     execution_timeout_ms: Optional timeout in milliseconds for each execution.
+    ///     callback_timeout_ms: Optional timeout in milliseconds for each host callback.
     ///     callbacks: Optional callbacks that sandboxed code can invoke.
     ///         Can be a CallbackRegistry or a list of callback dicts.
     ///
@@ -115,13 +118,14 @@ impl Session {
     ///         {"name": "get_time", "fn": get_time, "description": "Returns current time"}
     ///     ])
     #[new]
-    #[pyo3(signature = (*, vfs=None, vfs_mount_path=None, execution_timeout_ms=None, max_fuel=None, network=None, callbacks=None, mcp=None, volumes=None, on_stdout=None, on_stderr=None, result_variable=None, track_linear_memory=false))]
+    #[pyo3(signature = (*, vfs=None, vfs_mount_path=None, execution_timeout_ms=None, callback_timeout_ms=10000, max_fuel=None, network=None, callbacks=None, mcp=None, volumes=None, on_stdout=None, on_stderr=None, result_variable=None, track_linear_memory=false, linear_memory_initial_bytes=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         vfs: Option<VfsStorage>,
         vfs_mount_path: Option<String>,
         execution_timeout_ms: Option<u64>,
+        callback_timeout_ms: Option<u64>,
         max_fuel: Option<u64>,
         network: Option<NetConfig>,
         callbacks: Option<Bound<'_, PyAny>>,
@@ -131,6 +135,7 @@ impl Session {
         on_stderr: Option<Py<PyAny>>,
         result_variable: Option<String>,
         track_linear_memory: bool,
+        linear_memory_initial_bytes: Option<usize>,
     ) -> PyResult<Self> {
         // Create a tokio runtime for async execution
         let runtime = Arc::new(
@@ -141,11 +146,20 @@ impl Session {
                     InitializationError::new_err(format!("failed to create runtime: {e}"))
                 })?,
         );
+        if linear_memory_initial_bytes.is_some() && !track_linear_memory {
+            return Err(InitializationError::new_err(
+                "linear_memory_initial_bytes requires track_linear_memory=True",
+            ));
+        }
 
         // Create the PythonExecutor from embedded runtime.
         #[cfg(unix)]
         let (mut executor, host_memory_tracker) = if track_linear_memory {
-            let creator = eryx::host_memory::TrackingMemoryCreator::new();
+            let creator = if let Some(initial_bytes) = linear_memory_initial_bytes {
+                eryx::host_memory::TrackingMemoryCreator::new_with_initial_size_floor(initial_bytes)
+            } else {
+                eryx::host_memory::TrackingMemoryCreator::new()
+            };
             let tracker = creator.tracker();
             let executor =
                 eryx::PythonExecutor::from_embedded_runtime_with_memory_creator(Arc::new(creator))
@@ -166,6 +180,11 @@ impl Session {
             if track_linear_memory {
                 return Err(InitializationError::new_err(
                     "track_linear_memory is only supported on Unix platforms",
+                ));
+            }
+            if linear_memory_initial_bytes.is_some() {
+                return Err(InitializationError::new_err(
+                    "linear_memory_initial_bytes is only supported on Unix platforms",
                 ));
             }
             eryx::PythonExecutor::from_embedded_runtime().map_err(|e| {
@@ -276,6 +295,7 @@ impl Session {
             runtime,
             vfs_storage,
             vfs_mount_path: mount_path,
+            callback_timeout_ms,
             callbacks: callbacks_map,
             net_config,
             output_handler,
@@ -323,6 +343,7 @@ impl Session {
         let callbacks_map = self.callbacks.clone();
         let output_handler = self.output_handler.clone();
         let net_config = self.net_config.clone();
+        let callback_timeout_ms = self.callback_timeout_ms;
 
         // Release the GIL while executing
         py.detach(|| {
@@ -345,11 +366,14 @@ impl Session {
 
                     // Spawn callback handler task
                     let handler_callbacks = callbacks_map.clone();
+                    let mut callback_limits = eryx::ResourceLimits::default();
+                    callback_limits.callback_timeout =
+                        callback_timeout_ms.map(Duration::from_millis);
                     let handler = tokio::spawn(async move {
                         eryx::callback_handler::run_callback_handler(
                             callback_rx,
                             handler_callbacks,
-                            eryx::ResourceLimits::default(),
+                            callback_limits,
                             std::sync::Arc::new(std::collections::HashMap::new()),
                         )
                         .await
@@ -718,6 +742,94 @@ impl Session {
                 "linear-memory tracking is only supported on Unix platforms",
             ))
         }
+    }
+
+    /// Negative metadata-only grow probe for fresh-session restore.
+    ///
+    /// Caller must use this only after `execute()` has returned and no guest code
+    /// can run concurrently. This is kept to fail loudly for the path that does
+    /// not update Wasmtime VM memory length. Use `linear_memory_initial_bytes`
+    /// on fresh tracked session construction, then `restore_linear_memory_regions`.
+    fn restore_linear_memory_regions_growing<'py>(
+        &self,
+        py: Python<'py>,
+        regions: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        #[cfg(unix)]
+        {
+            let tracker = self.linear_memory_tracker()?;
+            let list = regions.cast::<PyList>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "linear-memory regions must be a list of dicts",
+                )
+            })?;
+
+            let mut snapshots = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                let dict = item.cast::<PyDict>().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "linear-memory region entries must be dicts",
+                    )
+                })?;
+                let id = dict
+                    .get_item("id")?
+                    .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing 'id'"))?
+                    .extract()?;
+                let byte_capacity = dict
+                    .get_item("byte_capacity")?
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyKeyError::new_err("missing 'byte_capacity'")
+                    })?
+                    .extract()?;
+                let bytes = dict
+                    .get_item("bytes")?
+                    .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing 'bytes'"))?;
+                let bytes = bytes.cast::<PyBytes>().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "linear-memory region 'bytes' must be bytes",
+                    )
+                })?;
+                snapshots.push(eryx::host_memory::HostMemoryRegionSnapshot {
+                    id,
+                    byte_capacity,
+                    bytes: bytes.as_bytes().to_vec(),
+                });
+            }
+
+            let stats = tracker
+                .restore_live_regions_growing(&snapshots)
+                .map_err(InitializationError::new_err)?;
+            let dict = PyDict::new(py);
+            dict.set_item("restored_regions", stats.restored_regions)?;
+            dict.set_item("restored_bytes", stats.restored_bytes)?;
+            Ok(dict)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = py;
+            let _ = regions;
+            Err(InitializationError::new_err(
+                "linear-memory tracking is only supported on Unix platforms",
+            ))
+        }
+    }
+
+    /// Return the root component export kind for a given export name.
+    ///
+    /// This is a PRD 010 host-side introspection hook used to determine whether
+    /// the component exposes a memory handle or only typed component functions.
+    fn root_component_export_kind(&self, name: &str) -> PyResult<Option<String>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| InitializationError::new_err("session lock poisoned"))?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| InitializationError::new_err("session not initialized"))?;
+        session
+            .root_component_export_kind(name)
+            .map(|kind| kind.map(str::to_string))
+            .map_err(eryx_error_to_py)
     }
 
     /// Restore Python state from a previously captured snapshot.
